@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Union
 
 import anndata as ad
 import pandas as pd
+import numpy as np
 import scipy
 import torch
 from matplotlib import pyplot as plt
@@ -164,28 +165,7 @@ class MultiVAE(BaseModelClass, ArchesMixin):
         )
 
         self.init_params_ = self._get_init_params(locals())
-
-    def impute(self, target_modality, adata=None, batch_size=256):
-        """Impute values for the target modality."""
-        with torch.no_grad():
-            self.module.eval()
-            if not self.is_trained_:
-                raise RuntimeError("Please train the model first.")
-
-            adata = self._validate_anndata(adata)
-
-            scdl = self._make_data_loader(adata=adata, batch_size=batch_size)
-
-            imputed = []
-            for tensors in scdl:
-                _, generative_outputs = self.module.forward(tensors, compute_loss=False)
-
-                rs = generative_outputs["rs"]
-                r = rs[target_modality]
-                imputed += [r.cpu()]
-
-            return torch.cat(imputed).squeeze().numpy()
-
+            
     @torch.inference_mode()
     def get_latent_representation(self, adata=None, batch_size=256):
         """Return the latent representation."""
@@ -511,3 +491,90 @@ class MultiVAE(BaseModelClass, ArchesMixin):
         model.is_trained_ = False
 
         return model
+
+
+    # adjusted from 
+    # https://github.com/scverse/scvi-tools/blob/13c37d3e5bfb6e6814f61838020cc19f83ab95b5/scvi/model/_totalvi.py#L346
+    # accessed on 28 November 2022
+    @torch.inference_mode()
+    def get_normalized_expression(
+        self,
+        modalities,
+        adata=None,
+        indices=None,
+        n_samples_overall: Optional[int] = None,
+        n_samples: int = 1,
+        use_z_mean: bool = True,
+        batch_size: int = 256,
+        return_mean: bool = True,
+    ) -> List[np.ndarray]:
+        """
+        Returns the normalized expression for specified modalities.
+
+        Parameters
+        ----------
+        modalities
+            Which modalities to return the expression for, e.g. `[0, 1]`.
+        adata
+            AnnData object with equivalent structure to initial AnnData. If `None`, defaults to the
+            AnnData object used to initialize the model.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        n_samples_overall
+            Number of samples to use in total
+        n_samples
+            Get sample scale from multiple samples.
+        use_z_mean
+            If True, use the mean of the latent distribution, otherwise sample from it
+        batch_size
+            Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
+        return_mean
+            Whether to return the mean of the samples.
+        Returns
+        -------
+        - List of normalized expressions for specified modalities
+        If ``n_samples`` > 1 and ``return_mean`` is False, then the shape is ``(samples, cells, genes)``.
+        Otherwise, shape is ``(cells, genes)``. Return type is ``np.ndarray``.
+        """
+        adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata)
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        if n_samples_overall is not None:
+            indices = np.random.choice(indices, n_samples_overall)
+        post = self._make_data_loader(
+            adata=adata, indices=indices, batch_size=batch_size
+        )
+        exprs = [[]] * len(modalities)
+        for tensors in post:
+            inference_kwargs = dict(n_samples=n_samples)
+            _, generative_outputs = self.module.forward(
+                tensors=tensors,
+                inference_kwargs=inference_kwargs,
+                compute_loss=False,
+            )
+            reconstructed = generative_outputs["rs"]
+            # print('all rs')
+            # print(len(reconstructed))
+            # print(reconstructed[0].shape)
+            reconstructed = [reconstructed[i] for i in modalities]
+            for mod in range(len(modalities)):
+                exprs[mod].extend(reconstructed[mod])
+    
+        if n_samples > 1:
+            for mod in range(len(exprs)):
+                # concatenate along batch dimension -> result shape = (samples, cells, features)
+                exprs[mod] = torch.cat(exprs[mod], dim=1)
+                # (cells, features, samples)
+                exprs[mod] = exprs[mod].permute(1, 2, 0)
+        else:
+            for mod in range(len(exprs)):
+                exprs[mod] = torch.cat(exprs[mod], dim=0)
+
+        if return_mean is True and n_samples > 1:
+            for mod in range(len(exprs)):
+                exprs[mod] = torch.mean(exprs[mod], dim=-1)
+
+        for mod in range(len(exprs)):
+            exprs[mod] = exprs[mod].cpu().numpy()
+        return exprs

@@ -320,6 +320,7 @@ class MultiVAETorch(BaseModuleClass):
 
     def _get_generative_input(self, tensors, inference_outputs):
         z_joint = inference_outputs["z_joint"]
+        z_joint_resampled = inference_outputs["z_joint_resampled"]
 
         cont_key = REGISTRY_KEYS.CONT_COVS_KEY
         cont_covs = tensors[cont_key] if cont_key in tensors.keys() else None
@@ -327,7 +328,7 @@ class MultiVAETorch(BaseModuleClass):
         cat_key = REGISTRY_KEYS.CAT_COVS_KEY
         cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
 
-        return {"z_joint": z_joint, "cat_covs": cat_covs, "cont_covs": cont_covs}
+        return {"z_joint": z_joint, "cat_covs": cat_covs, "cont_covs": cont_covs, "z_joint_resampled": z_joint_resampled}
 
     @auto_move_data
     def inference(
@@ -336,6 +337,7 @@ class MultiVAETorch(BaseModuleClass):
         cat_covs: Optional[torch.Tensor] = None,
         cont_covs: Optional[torch.Tensor] = None,
         masks: Optional[List[torch.Tensor]] = None,
+        n_samples: int = 1,
     ) -> Dict[str, Union[torch.Tensor, List[torch.Tensor]]]:
         """Compute necessary inference quantities.
 
@@ -347,8 +349,10 @@ class MultiVAETorch(BaseModuleClass):
             Continuous covariates to condition on
         :param masks:
             List of binary tensors indicating which values in ``x`` belong to which modality
+        :param n_samples:
+            Number of samples to sample from approximate posterior
         :returns:
-            Joint representations, marginal representations, joint mu's and logvar's.
+            Joint representations, marginal representations, joint mu's and logvar's, and if ``n_samples > 1`` resampled joint representations.
         """
         # split x into modality xs
         if torch.is_tensor(x):
@@ -403,25 +407,37 @@ class MultiVAETorch(BaseModuleClass):
         logvar = torch.stack(logvars, dim=1)
         mu_joint, logvar_joint = self._product_of_experts(mu, logvar, masks)
         z_joint = self._reparameterize(mu_joint, logvar_joint)
+        z_joint_resampled = None
+        if n_samples > 1:
+            z_joint_resampled = []
+            for _ in n_samples:
+                z_joint_resampled.append(self._reparameterize(mu_joint, logvar_joint))
+
         # drop mus and logvars according to masks for kl calculation
         # TODO here or in loss calculation? check multiVI
         # return mus+mus_joint
-        return {"z_joint": z_joint, "mu": mu_joint, "logvar": logvar_joint, "z_marginal": z_marginal}
+        return {"z_joint": z_joint, "mu": mu_joint, "logvar": logvar_joint, "z_marginal": z_marginal, "z_joint_resampled": z_joint_resampled}
 
     @auto_move_data
     def generative(
-        self, z_joint: torch.Tensor, cat_covs: Optional[torch.Tensor] = None, cont_covs: Optional[torch.Tensor] = None
+        self, 
+        z_joint: torch.Tensor, 
+        z_joint_resampled: Optional[List[torch.Tensor]] = None,
+        cat_covs: Optional[torch.Tensor] = None, 
+        cont_covs: Optional[torch.Tensor] = None
     ) -> Dict[str, List[torch.Tensor]]:
         """Compute necessary inference quantities.
 
         :param z_joint:
             Tensor of values with shape ``(batch_size, z_dim)``
+        :param z_joint_resampled:
+            List of resampled tensors
         :param cat_covs:
             Categorical covariates to condition on
         :param cont_covs:
             Continuous covariates to condition on
         :returns:
-            Reconstructed values for each modality.
+            Reconstructed values for each modality
         """
         z = z_joint.unsqueeze(1).repeat(1, self.n_modality, 1)
         zs = torch.split(z, 1, dim=1)
